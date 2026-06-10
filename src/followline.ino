@@ -46,13 +46,17 @@ const int ULTRA_D0_PIN  = 7;
  * ============================================================ */
 
 // 直走基础速度。先调小（50~70）把巡线调稳，再慢慢加快。
-const int baseSpeed = 105;
+const int baseSpeed = 110;
 
 // PWM 上限，防止太快冲出弯道
 const int maxPWM = 150;
 
 // 最小启动 PWM：电机太小占空比只嗡嗡不转，给个下限（仅对“需要转的轮”生效）
 const int minPWM = 35;
+
+// Force a strong right turn immediately after line loss.
+const int lostRightLeftSpeed = 70;
+const int lostRightRightSpeed = -105;
 
 // 左右轮机械差异补偿：左轮偏弱就把 leftTrim 调大一点点（±0~15）。
 // 注意：直走跑偏优先用这个修，而不是去动 PID。
@@ -83,7 +87,7 @@ float Kd = 8.0f;    // 微分：抑制摆动/过冲
  *   - 把每个传感器分别停在白地面上，记下 L_raw/M_raw/R_raw。
  *   - 把下面三个值填成“白底读数 + 一点余量(约 +1000~2000)”。
  */
-int sensorWhite[3] = { 8788, 1459, 1200 };  // 左 / 中 / 右 白底基线
+int sensorWhite[3] = { 9600, 2200, 2600 };  // 左 / 中 / 右 白底基线
 
 const int irAdsChannel[3] = { 2, 1, 0 };       // 左, 中, 右
 
@@ -114,7 +118,8 @@ void setup() {
     pinMode(in4Pin, OUTPUT);
     pinMode(enablePin1, OUTPUT);
     pinMode(enablePin2, OUTPUT);
-    
+    // D7 is used by the right motor direction input on this car.
+    // pinMode(ULTRA_D0_PIN, INPUT);
 
     Wire.begin();
     Wire.setClock(400000);                 // I2C 提速到 400kHz，缩短读取耗时
@@ -198,64 +203,35 @@ void ComputeError() {
  *  error>0 => 线在右 => 需要右转 => 左轮快、右轮慢
  * ============================================================ */
 void PidControl() {
-    static bool wasLost = false;
-
-    // 丢线后直接使用固定强转，不再依赖普通PD
+    // Highest priority: bypass normal PD while the line is lost.
     if (lineLost) {
         integral = 0.0f;
-        wasLost = true;
-
-        if (error > 0.0f) {
-            // 上次黑线在右边：向右原地找线
-            leftSpeed  = 150;
-            rightSpeed = -65;
-        }
-        else if (error < 0.0f) {
-            // 上次黑线在左边：向左原地找线
-            leftSpeed  = -65;
-            rightSpeed = 150;
-        }
-        else {
-            // 没有可靠方向：慢速直行
-            leftSpeed  = 70;
-            rightSpeed = 70;
-        }
-
-        lastError = error;
+        lastError = 100.0f;
+        leftSpeed = lostRightLeftSpeed;
+        rightSpeed = lostRightRightSpeed;
         return;
-    }
-
-    // 刚找回黑线时清除D项冲击
-    if (wasLost) {
-        lastError = error;
-        integral = 0.0f;
-        wasLost = false;
     }
 
     float p = error;
     float d = error - lastError;
 
-    if (Ki == 0.0f) {
+    // 积分（带抗饱和；丢线时清零防止乱积累）
+    if (lineLost || Ki == 0.0f) {
         integral = 0.0f;
-    }
-    else {
+    } else {
         integral += error;
         integral = constrain(integral, -200.0f, 200.0f);
     }
 
-    float correction =
-        Kp * p +
-        Ki * integral +
-        Kd * d;
+    float correction = Kp * p + Ki * integral + Kd * d;
 
     lastError = error;
 
-    leftSpeed =
-        baseSpeed + leftTrim + (int)correction;
-
-    rightSpeed =
-        baseSpeed + rightTrim - (int)correction;
+    // 修正量允许超过基速 -> 内轮反转，可过急弯
+    leftSpeed  = baseSpeed + leftTrim  + (int)correction;
+    rightSpeed = baseSpeed + rightTrim - (int)correction;
 }
+
 
 /* ============================================================
  *  Drive(): 限幅 + 方向处理后交给 setMotor

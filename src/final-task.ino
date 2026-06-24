@@ -13,7 +13,7 @@
  * 5. 小车停在空中不动 -> 轮子继续转动
  * 6. 一旦检测到小车开始向下 -> 轮子停止
  * 7. 向下停住后的反弹不会重新触发轮子转动
- * 8. 没有使用任何 LED，引脚 D3 和 D11 空出
+ * 8. 已加入陀螺仪零偏校准：开机静止时 Gx/Gy/Gz 会自动归零到 0 附近
  *
  * UNO / Nano:
  * A4 = SDA
@@ -72,36 +72,26 @@ const byte MPU_REG_GYRO_XOUT_H    = 0x43;
 
 /* ===================== 可调参数 ===================== */
 
-// 如果某一侧电机方向反了，把 false 改成 true，或者用串口命令 reverseR / reverseL 调试
 bool reverseRightMotor = false;
 bool reverseLeftMotor  = false;
 
-// 抬起后电机前进速度，范围 0~255
 int testForwardSpeed = 130;
 
-// IR 黑线判断阈值
 int irBlackThreshold = 10000;
 
-// MPU 量程：加速度 ±2g，陀螺仪 ±250 deg/s
 const float MPU_ACCEL_SCALE = 16384.0;
 const float MPU_GYRO_SCALE  = 131.0;
 
-// 抬起 / 下降判断阈值
-float liftDiffG = 0.20;       // 检测向上动作
-float downDiffG = -0.15;      // 检测开始下降
+float liftDiffG = 0.20;
+float downDiffG = -0.15;
 
-// 抬起确认次数
 int liftConfirmNeed = 1;
 
-// 向上触发后，短暂忽略“下降信号”
 unsigned long liftSettleIgnoreDownMs = 1000;
-
-// 下降停止后，屏蔽抬起触发，防止反弹误触发
 unsigned long lowerToLiftLockoutMs = 1000;
 
-// 时间控制
 const unsigned long RECORD_INTERVAL_MS = 100;
-const unsigned long PRINT_INTERVAL_MS  = 500;
+const unsigned long PRINT_INTERVAL_MS  = 1000;
 const unsigned long MOTION_INTERVAL_MS = 50;
 
 /* ===================== 传感器对象 ===================== */
@@ -126,6 +116,12 @@ float baseNorm = 1.0;
 float unitGx = 0.0;
 float unitGy = 0.0;
 float unitGz = 1.0;
+
+/* ===================== 陀螺仪零偏变量 ===================== */
+
+float gyroBiasX = 0.0;
+float gyroBiasY = 0.0;
+float gyroBiasZ = 0.0;
 
 /* ===================== 抬起 / 下降状态变量 ===================== */
 
@@ -278,7 +274,15 @@ bool readMPUWord(byte reg, int16_t &value)
   return false;
 }
 
-bool readMPURawData(float &ax, float &ay, float &az, float &gx, float &gy, float &gz)
+/*
+ * applyGyroBias = true  ：正常读取，Gx/Gy/Gz 会减去开机静止零偏
+ * applyGyroBias = false ：校准时使用原始陀螺仪数据
+ */
+bool readMPURawData(
+  float &ax, float &ay, float &az,
+  float &gx, float &gy, float &gz,
+  bool applyGyroBias = true
+)
 {
   int16_t axRaw = 0;
   int16_t ayRaw = 0;
@@ -327,6 +331,12 @@ bool readMPURawData(float &ax, float &ay, float &az, float &gx, float &gy, float
   gy = gyRaw / MPU_GYRO_SCALE;
   gz = gzRaw / MPU_GYRO_SCALE;
 
+  if (applyGyroBias) {
+    gx -= gyroBiasX;
+    gy -= gyroBiasY;
+    gz -= gyroBiasZ;
+  }
+
   return true;
 }
 
@@ -366,7 +376,7 @@ bool initMPURaw()
   float gz = 0.0;
 
   for (int i = 0; i < 10; i++) {
-    if (readMPURawData(ax, ay, az, gx, gy, gz)) {
+    if (readMPURawData(ax, ay, az, gx, gy, gz, false)) {
       return true;
     }
 
@@ -418,6 +428,11 @@ void calibrateMPUBase()
   float sumAx = 0.0;
   float sumAy = 0.0;
   float sumAz = 0.0;
+
+  float sumGx = 0.0;
+  float sumGy = 0.0;
+  float sumGz = 0.0;
+
   int validCount = 0;
 
   delay(500);
@@ -431,10 +446,15 @@ void calibrateMPUBase()
     float gy = 0.0;
     float gz = 0.0;
 
-    if (readMPURawData(ax, ay, az, gx, gy, gz)) {
+    if (readMPURawData(ax, ay, az, gx, gy, gz, false)) {
       sumAx += ax;
       sumAy += ay;
       sumAz += az;
+
+      sumGx += gx;
+      sumGy += gy;
+      sumGz += gz;
+
       validCount++;
     }
 
@@ -445,6 +465,10 @@ void calibrateMPUBase()
     baseAx = sumAx / validCount;
     baseAy = sumAy / validCount;
     baseAz = sumAz / validCount;
+
+    gyroBiasX = sumGx / validCount;
+    gyroBiasY = sumGy / validCount;
+    gyroBiasZ = sumGz / validCount;
 
     baseNorm = sqrt(baseAx * baseAx + baseAy * baseAy + baseAz * baseAz);
 
@@ -469,6 +493,13 @@ void calibrateMPUBase()
     Serial.print(F(" Norm="));
     Serial.print(baseNorm, 3);
     Serial.println(F(" g"));
+
+    Serial.print(F("Gyro Bias Gx="));
+    Serial.print(gyroBiasX, 3);
+    Serial.print(F(" Gy="));
+    Serial.print(gyroBiasY, 3);
+    Serial.print(F(" Gz="));
+    Serial.println(gyroBiasZ, 3);
   }
   else {
     Serial.println(F("MPU baseline calibration failed."));
@@ -740,7 +771,7 @@ void printHelp()
   Serial.println(F("run                  -> manual run forward"));
   Serial.println(F("stop                 -> stop motor and exit manual mode"));
   Serial.println(F("auto                 -> exit manual mode, use lift detection"));
-  Serial.println(F("base                 -> recalibrate MPU baseline"));
+  Serial.println(F("base                 -> recalibrate MPU accel baseline and gyro bias"));
   Serial.println(F("scan                 -> scan I2C bus"));
   Serial.println(F("================================================"));
   Serial.println();
@@ -931,7 +962,7 @@ void setup()
   Serial.println(F("Hold robot in the air: wheels keep running"));
   Serial.println(F("Move robot downward: wheels stop"));
   Serial.println(F("Landing rebound will be ignored"));
-  Serial.println(F("No LED pins are used"));
+  Serial.println(F("Gyro bias calibration enabled"));
   Serial.println(F("Serial Monitor: 115200 baud"));
   Serial.println(F("Type help to show debug commands"));
   Serial.println(F("=============================================="));
